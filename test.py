@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
 from torch.autograd import Variable
+import torchvision.transforms as transforms
 from craft import CRAFT
 
 from PIL import Image
@@ -19,6 +20,10 @@ import file_utils
 import json
 import zipfile
 from collections import OrderedDict
+
+#import crnn related
+import CRNN.crnn as crnn
+import crnn_utils
 
 #os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 
@@ -40,9 +45,9 @@ parser.add_argument('--test_folder', default='./test_data/eng/384/', type=str, h
 parser.add_argument('--refine', default=False, action='store_true', help='enable link refiner')
 parser.add_argument('--refiner_model', default='weights/craft_refiner_CTW1500.pth', type=str, help='pretrained refiner model')
 parser.add_argument('--output_folder', default='./test_results/eng/', type=str, help='output path')
+parser.add_argument('--crnn_weights', default='./weights/crnn.pth', type=str, help='Where is the crnn model weights')
 
 args = parser.parse_args()
-
 
 """ For test images in a folder """
 image_list, _, _ = file_utils.get_files(args.test_folder)
@@ -120,6 +125,19 @@ class ReaderData(object):
         crop = cv.resize(crop, (self.crop_width, self.crop_height))
         print("Croping the image:{}".format(time.time() - t0))
         return crop, [crop_finger_pos_w, crop_finger_pos_h]
+
+class resizeNormalize(object):
+    # this is used for the crnn's data preprocessing
+    def __init__(self, size, interpolation=Image.BILINEAR):
+        self.size = size
+        self.interpolation = interpolation
+        self.toTensor = transforms.ToTensor()
+
+    def __call__(self, img):
+        img = img.resize(self.size, self.interpolation)
+        img = self.toTensor(img)
+        img.sub_(0.5).div_(0.5)
+        return img
 
 def copyStateDict(state_dict):
     if list(state_dict.keys())[0].startswith("module"):
@@ -209,26 +227,36 @@ def findNearest(finger_pos, bboxes):
         if dist < min_dis:
             nearest_id = idx
             min_dis = dist
-    print("The nearest position id: {}".format(nearest_id))
+    #print("The nearest position id: {}".format(nearest_id))
     return nearest_id
 
 if __name__ == '__main__':
     
-    # load net
+    # load net of craft
     net = CRAFT()     # initialize
-
-    print('Loading weights from checkpoint (' + args.trained_model + ')')
+    print('Loading CRAFT weights from checkpoint (' + args.trained_model + ')')
     if args.cuda:
         net.load_state_dict(copyStateDict(torch.load(args.trained_model)))
     else:
         net.load_state_dict(copyStateDict(torch.load(args.trained_model, map_location='cpu')))
-
     if args.cuda:
         net = net.cuda()
         net = torch.nn.DataParallel(net)
         cudnn.benchmark = False
-
     net.eval()
+
+    # load the crnn related model, parameters
+    model_path = args.crnn_weights
+    crnn_net = crnn.CRNN(32, 1, 37, 256)
+    alphabet = '0123456789abcdefghijklmnopqrstuvwxyz'
+    if torch.cuda.is_available():
+        crnn_net = crnn_net.cuda()
+    print('Loading CRNN weights from checkpoint (' + model_path + ')')
+    crnn_net.load_state_dict(torch.load(model_path))
+
+    converter = crnn_utils.strLabelConverter(alphabet)
+    transformer = resizeNormalize((100, 32))
+    crnn_net.eval()
 
     # LinkRefiner
     refine_net = None
@@ -245,62 +273,58 @@ if __name__ == '__main__':
 
         refine_net.eval()
         args.poly = True
-
-    #t = time.time()
-
-    # load data
-    """
-    for k, image_path in enumerate(image_list):
-        #image_path = "./test_data/chi/0021_crop.jpg"
-        print("Test image{:s}".format(image_path), end='\r')
-        image = imgproc.loadImage(image_path)
-        #print("The image 's path:{}\ttype:{}".format(image_path, type(image)))
-
-        bboxes, polys, score_text = test_net(net, image, args.text_threshold, args.link_threshold, args.low_text, args.cuda, args.poly, refine_net)
-
-        # save score text
-        filename, file_ext = os.path.splitext(os.path.basename(image_path))
-        mask_file = result_folder + "/res_" + filename + '_mask.jpg'
-        cv.imwrite(mask_file, score_text)
-
-        file_utils.saveResult(image_path, image[:,:,::-1], polys, dirname=result_folder)
-
-    print("elapsed time : {}s".format(time.time() - t))
-    """
     
     # test the dataset's function
     data = ReaderData('./test_data/eng/')
     #print(test_data.FileNames)
     for item in data.FileNames:
-        print("-------------------{}-------------------------".format(item))
+        print("-------------------{}---------------------".format(item))
         j_path = os.path.join(data.RootDir, (item+data.JsonExt))
         i_path = os.path.join(data.RootDir, (item+data.ImgExt))
         #crop_save_path = os.path.join(data.RootDir, ('crop_'+item+data.ImgExt))
         #t0 = time.time()
         crop, finger_new_pos = data.cropImage(i_path, j_path)
-        #print("Cropping:{}".format(time.time() - t0))
-        #data.saveCropImage(crop_save_path, crop)
         # do the text detection:
         bboxes, polys, score_text = test_net(net, crop, args.text_threshold, args.link_threshold, args.low_text, args.cuda, args.poly, refine_net)
-        print("bboxes:\n{}, type:\n{}, \ntotal:\t{}".format(bboxes, type(bboxes), len(bboxes)))
+        #print("bboxes:\n{}, type:\n{}, \ntotal:\t{}".format(bboxes, type(bboxes), len(bboxes)))
 
         t0 = time.time()
         nearest_id = findNearest(finger_new_pos, bboxes)
         critical_box = bboxes[nearest_id]
         print("The critical box:{}".format(critical_box))
         min_value, max_value = critical_box.min(axis = 0), critical_box.max(axis = 0)
-        print("crop paras:\t{}\t{}\t".format(min_value, max_value))
+        #print("crop paras:\t{}\t{}\t".format(min_value, max_value))
         h_0 = int(min_value[1])
         h_1 = int(max_value[1])
         w_0 = int(min_value[0])
         w_1 = int(max_value[0])
         text_crop = crop[h_0:h_1, w_0:w_1]
+        #print("=========={}".format(type(text_crop)))
         print("Finding the nearest one and crop it:{}".format(time.time() - t0))
         text_area_path = 'text_area_'+ item + data.ImgExt
         io.imsave(os.path.join(result_folder, text_area_path), text_crop)
         
         mask_file = result_folder + "/res_" + item + '_mask.jpg'
         cv.imwrite(mask_file, score_text)
-        file_utils.saveResult((item+data.ImgExt), crop[:,:,::-1], polys, dirname=result_folder)
-    
+        file_utils.saveResult((item+data.ImgExt), crop[:,:,::-1], polys, dirname = result_folder)
+
+        ## crnn based recognition process
+        t0 = time.time()
+        text_crop = Image.fromarray(text_crop).convert('L')
+        text_crop = transformer(text_crop)
+        if torch.cuda.is_available():
+            #print("True")
+            text_crop = text_crop.cuda()
+        text_crop = text_crop.view(1, *text_crop.size())
+        text_crop = Variable(text_crop)
+        preds = crnn_net(text_crop)
+        _, preds = preds.max(2)
+        preds = preds.transpose(1, 0).contiguous().view(-1)
+
+        preds_size = Variable(torch.IntTensor([preds.size(0)]))
+        raw_pred = converter.decode(preds.data, preds_size.data, raw=True)
+        sim_pred = converter.decode(preds.data, preds_size.data, raw=False)
+        print("crnn recognition time:{}".format(time.time() - t0))
+        print('%-20s => %-20s' % (raw_pred, sim_pred))
+
     #print("elapsed time : {}s".format(time.time() - t))
